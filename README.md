@@ -1,1 +1,1 @@
-# WSI-P2P
+# WSI-P2P - The manuscript is under review at *****. All the relevant information will be available for future research work to promote advancements in the field, foster collaboration among researchers, and enhance our understanding of the subject matter.
