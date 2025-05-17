@@ -8,13 +8,12 @@
 
 This repository contains the official implementation of the paper:  
 **"Comparative Study of MIL Aggregators for Ovarian Cancer Subtype Classification"**  
-*[Authors]*, *[Conference/Journal]*, *[Year]*  
 
 ## 🚀 Key Features
 - **Comparative analysis** of MIL aggregators (Mean/Max/LSE/Attention/K-Top) on histopathology data
 - **Novel K-Top pooling** for sparse tumor detection
-- **Reproducible benchmarks** on TCGA & in-house datasets
-- **Attention visualization** tools for interpretability
+- **Reproducible benchmarks** 
+- **Attention visualization** 
 
 ## 📦 Installation
 ```bash
