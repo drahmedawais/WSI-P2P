@@ -1,0 +1,2393 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Main Includes"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import numpy as np\n",
+    "import torch\n",
+    "from PIL import Image\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "from torchvision import models, transforms\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from torch.utils.data import Dataset, DataLoader\n",
+    "from tqdm import tqdm\n",
+    "import pickle\n",
+    "import matplotlib.pyplot as plt\n",
+    "from sklearn.manifold import TSNE\n",
+    "from sklearn.metrics import (accuracy_score, balanced_accuracy_score, \n",
+    "                           f1_score, confusion_matrix, classification_report)\n",
+    "from torch.optim.lr_scheduler import ReduceLROnPlateau\n",
+    "import seaborn as sns\n",
+    "import pandas as pd"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Class Code"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class MILExperiment:\n",
+    "    def __init__(self, base_dir, main_data_dir, max_bags_per_class=None):\n",
+    "        self.device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "        print(self.device)\n",
+    "        self.base_dir = base_dir\n",
+    "        self.main_data_dir = main_data_dir\n",
+    "        self.class_labels = ['CC', 'MC', 'LGSC', 'HGSC', 'EC']\n",
+    "        self.bag_sizes = [50,25,10]\n",
+    "        self.num_trials = 2\n",
+    "        self.batch_size = 4\n",
+    "        self.max_bags_per_class = max_bags_per_class\n",
+    "        self.patience = 10\n",
+    "        \n",
+    "        os.makedirs(os.path.join(self.base_dir, 'plots'), exist_ok=True)\n",
+    "        \n",
+    "        self.mil_methods = {\n",
+    "            'InstanceMIL': self.InstanceMIL,\n",
+    "            'EmbeddingMIL': self.EmbeddingMIL,  # Add this\n",
+    "            'ImprovedAttentionMIL': self.ImprovedAttentionMIL\n",
+    "        }\n",
+    "        \n",
+    "        self.setup_transforms()\n",
+    "        self.preprocessed_data = {}\n",
+    "        self.metric_history = {}\n",
+    "\n",
+    "    def setup_transforms(self):\n",
+    "        self.train_transform = transforms.Compose([\n",
+    "            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),\n",
+    "            transforms.RandomHorizontalFlip(),\n",
+    "            transforms.RandomVerticalFlip(),\n",
+    "            transforms.RandomRotation(20),\n",
+    "            transforms.ColorJitter(0.3, 0.3, 0.3, 0.1),\n",
+    "            transforms.GaussianBlur(3),\n",
+    "            transforms.ToTensor(),\n",
+    "            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])\n",
+    "        ])\n",
+    "        \n",
+    "        self.val_transform = transforms.Compose([\n",
+    "            transforms.Resize(256),\n",
+    "            transforms.CenterCrop(224),\n",
+    "            transforms.ToTensor(),\n",
+    "            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])\n",
+    "        ])\n",
+    "\n",
+    "    def preprocess_and_save_data(self):\n",
+    "        bags, labels = [], []\n",
+    "        for label_idx, label in enumerate(self.class_labels):\n",
+    "            class_dir = os.path.join(self.main_data_dir, label)\n",
+    "            case_count = 0\n",
+    "            for case in sorted(os.listdir(class_dir)):\n",
+    "                if self.max_bags_per_class and case_count >= self.max_bags_per_class:\n",
+    "                    break\n",
+    "                \n",
+    "                case_path = os.path.join(class_dir, case)\n",
+    "                if os.path.isdir(case_path):\n",
+    "                    tile_paths = [os.path.join(case_path, f) \n",
+    "                                for f in sorted(os.listdir(case_path)) \n",
+    "                                if f.endswith(('.png', '.jpg', '.jpeg'))]\n",
+    "                    \n",
+    "                    if len(tile_paths) == 50:\n",
+    "                        bags.append(tile_paths)\n",
+    "                        labels.append(label_idx)\n",
+    "                        case_count += 1\n",
+    "\n",
+    "        for idx, (bag, label) in enumerate(zip(bags, labels)):\n",
+    "            preprocessed_bag = []\n",
+    "            for path in bag:\n",
+    "                try:\n",
+    "                    img = Image.open(path).convert('RGB')\n",
+    "                    img = self.train_transform(img)\n",
+    "                    preprocessed_bag.append(img.numpy())\n",
+    "                except Exception as e:\n",
+    "                    print(f\"Error processing {path}: {str(e)}\")\n",
+    "                    continue\n",
+    "            \n",
+    "            if preprocessed_bag:\n",
+    "                self.preprocessed_data[str(idx)] = (np.stack(preprocessed_bag), label)\n",
+    "\n",
+    "        np.savez(os.path.join(self.base_dir, 'preprocessed_dataFull.npz'), **self.preprocessed_data)\n",
+    "        print(f\"Saved preprocessed data with {len(self.preprocessed_data)} bags\")\n",
+    "\n",
+    "    def load_preprocessed_data(self):\n",
+    "        data = np.load(os.path.join(self.base_dir, 'preprocessed_dataFull.npz'), allow_pickle=True)\n",
+    "        bags, labels = [], []\n",
+    "        for key in sorted(data.files, key=lambda x: int(x)):\n",
+    "            bags.append(data[key][0])\n",
+    "            labels.append(data[key][1])\n",
+    "        return bags, labels\n",
+    "\n",
+    "    def analyze_preprocessed_data(self):\n",
+    "        data = np.load(os.path.join(self.base_dir, 'preprocessed_dataFull.npz'), allow_pickle=True)\n",
+    "        \n",
+    "        print(\"\\n=== Data Analysis ===\")\n",
+    "        print(f\"Total bags: {len(data.files)}\")\n",
+    "        \n",
+    "        # Count bags per class\n",
+    "        class_counts = np.zeros(len(self.class_labels))\n",
+    "        instance_counts = []\n",
+    "        \n",
+    "        for key in data.files:\n",
+    "            bag, label = data[key]\n",
+    "            class_counts[label] += 1\n",
+    "            instance_counts.append(len(bag))\n",
+    "        \n",
+    "        print(\"\\nClass Distribution:\")\n",
+    "        for i, count in enumerate(class_counts):\n",
+    "            print(f\"{self.class_labels[i]}: {int(count)} bags\")\n",
+    "        \n",
+    "        print(\"\\nInstance Count Statistics:\")\n",
+    "        print(f\"Mean instances per bag: {np.mean(instance_counts):.1f}\")\n",
+    "        print(f\"Min instances: {np.min(instance_counts)}\")\n",
+    "        print(f\"Max instances: {np.max(instance_counts)}\")\n",
+    "        print(f\"Total instances: {np.sum(instance_counts)}\")\n",
+    "        \n",
+    "        # Verify data shapes\n",
+    "        sample_bag = data[data.files[0]][0]\n",
+    "        print(f\"\\nSample bag shape: {sample_bag.shape}\")\n",
+    "        print(f\"Sample tile shape: {sample_bag[0].shape}\")\n",
+    "    class MILDataset(Dataset):\n",
+    "        def __init__(self, bags, labels, bag_size=None):\n",
+    "            self.bags = bags\n",
+    "            self.labels = labels\n",
+    "            self.bag_size = bag_size\n",
+    "\n",
+    "        def __len__(self):\n",
+    "            return len(self.bags)\n",
+    "\n",
+    "        def __getitem__(self, idx):\n",
+    "            bag = self.bags[idx]\n",
+    "            if self.bag_size and len(bag) > self.bag_size:\n",
+    "                indices = np.random.choice(len(bag), self.bag_size, replace=False)\n",
+    "                bag = bag[indices]\n",
+    "            return torch.from_numpy(bag).float(), torch.tensor(self.labels[idx], dtype=torch.long)\n",
+    "    class EmbeddingMIL(nn.Module):\n",
+    "        def __init__(self, num_classes):\n",
+    "            super().__init__()\n",
+    "            # Use same feature extractor as other models\n",
+    "            self.fe = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)\n",
+    "            self.fe.fc = nn.Identity()  # Remove final FC layer\n",
+    "            \n",
+    "            # Classifier with dropout for regularization\n",
+    "            self.classifier = nn.Sequential(\n",
+    "                nn.Dropout(0.5),\n",
+    "                nn.Linear(2048, num_classes)\n",
+    "            )\n",
+    "\n",
+    "        def forward(self, x, return_features=False):\n",
+    "            \"\"\"\n",
+    "            Forward pass for mean-pooling MIL\n",
+    "            \n",
+    "            Args:\n",
+    "                x: input bags [batch_size, num_instances, C, H, W]\n",
+    "                return_features: whether to return pooled features\n",
+    "                \n",
+    "            Returns:\n",
+    "                logits: classification outputs\n",
+    "                pooled_features: (optional) mean-pooled features\n",
+    "            \"\"\"\n",
+    "            B, N, C, H, W = x.shape\n",
+    "            \n",
+    "            # Process all instances\n",
+    "            x = x.view(B*N, C, H, W)\n",
+    "            features = self.fe(x).view(B, N, -1)  # [B, N, 2048]\n",
+    "            \n",
+    "            # Mean pooling across instances\n",
+    "            pooled_features = features.mean(dim=1)  # [B, 2048]\n",
+    "            \n",
+    "            # Classification\n",
+    "            logits = self.classifier(pooled_features)\n",
+    "            \n",
+    "            if return_features:\n",
+    "                return logits, pooled_features\n",
+    "            return logits\n",
+    "    class InstanceMIL(nn.Module):\n",
+    "        def __init__(self, num_classes):\n",
+    "            super().__init__()\n",
+    "            self.fe = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)\n",
+    "            self.fe.fc = nn.Identity()\n",
+    "            self.classifier = nn.Sequential(\n",
+    "                nn.Dropout(0.5),\n",
+    "                nn.Linear(2048, num_classes)\n",
+    "            )\n",
+    "\n",
+    "        def forward(self, x, return_features=False):\n",
+    "            B, N, C, H, W = x.shape\n",
+    "            x = x.view(B*N, C, H, W)\n",
+    "            features = self.fe(x).view(B, N, -1)\n",
+    "            pooled_features = features.max(dim=1)[0]\n",
+    "            logits = self.classifier(pooled_features)\n",
+    "            \n",
+    "            if return_features:\n",
+    "                return logits, pooled_features\n",
+    "            return logits\n",
+    "\n",
+    "    class ImprovedAttentionMIL(nn.Module):\n",
+    "        def __init__(self, num_classes):\n",
+    "            super().__init__()\n",
+    "            self.fe = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)\n",
+    "            self.fe.fc = nn.Identity()\n",
+    "            \n",
+    "            self.attention = nn.Sequential(\n",
+    "                nn.Linear(2048, 512),\n",
+    "                nn.ReLU(),\n",
+    "                nn.Dropout(0.5),\n",
+    "                nn.Linear(512, 128),\n",
+    "                nn.Tanh(),\n",
+    "                nn.Linear(128, 1))\n",
+    "            \n",
+    "            self.classifier = nn.Sequential(\n",
+    "                nn.Dropout(0.5),\n",
+    "                nn.Linear(2048, num_classes))\n",
+    "            \n",
+    "        def forward(self, x, return_features=False):\n",
+    "            B, N, C, H, W = x.shape\n",
+    "            x = x.view(B*N, C, H, W)\n",
+    "            features = self.fe(x).view(B, N, -1)\n",
+    "            \n",
+    "            attn_weights = torch.softmax(self.attention(features).squeeze(-1), dim=1)\n",
+    "            weighted_features = (features * attn_weights.unsqueeze(-1)).sum(dim=1)\n",
+    "            logits = self.classifier(weighted_features)\n",
+    "            \n",
+    "            if return_features:\n",
+    "                return logits, weighted_features\n",
+    "            return logits\n",
+    "    def prepare_datasets(self, bags, labels, bag_size=None):\n",
+    "        x_train, x_test, y_train, y_test = train_test_split(\n",
+    "            bags, labels, test_size=0.2, stratify=labels, random_state=42)\n",
+    "        x_train, x_val, y_train, y_val = train_test_split(\n",
+    "            x_train, y_train, test_size=0.25, stratify=y_train, random_state=42)\n",
+    "        \n",
+    "        train_data = self.MILDataset(x_train, y_train, bag_size)\n",
+    "        val_data = self.MILDataset(x_val, y_val, bag_size)\n",
+    "        test_data = self.MILDataset(x_test, y_test, bag_size)\n",
+    "        \n",
+    "        return train_data, val_data, test_data\n",
+    "    def train_evaluate(self, model, optimizer, train_data, val_data, model_name):\n",
+    "        # train_loader = DataLoader(\n",
+    "        #     train_data, \n",
+    "        #     batch_size=self.batch_size,\n",
+    "        #     shuffle=True,\n",
+    "        #     # num_workers=2,       # Added\n",
+    "        #     # pin_memory=True,     # Added for CUDA\n",
+    "        #     # persistent_workers=True  # Maintains workers between epochs\n",
+    "        # )\n",
+    "        # val_loader = DataLoader(\n",
+    "        #     val_data, \n",
+    "        #     batch_size=self.batch_size,\n",
+    "        #     # num_workers=2,       # Added\n",
+    "        #     # pin_memory=True      # Added for CUDA\n",
+    "        # )\n",
+    "        train_loader = DataLoader(train_data, batch_size=self.batch_size, shuffle=True)\n",
+    "        val_loader = DataLoader(val_data, batch_size=self.batch_size)\n",
+    "        \n",
+    "        class_counts = np.bincount(train_data.labels)\n",
+    "        class_weights = 1. / torch.tensor(class_counts, dtype=torch.float32).to(self.device)\n",
+    "        criterion = nn.CrossEntropyLoss(weight=class_weights)\n",
+    "        \n",
+    "        scheduler = ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5, verbose=True)\n",
+    "        \n",
+    "        best_acc = 0\n",
+    "        no_improve = 0\n",
+    "        \n",
+    "        self.metric_history[model_name] = {\n",
+    "            'train_loss': [],\n",
+    "            'train_acc': [],\n",
+    "            'val_loss': [],\n",
+    "            'val_acc': [],\n",
+    "            'val_f1': []\n",
+    "        }\n",
+    "        \n",
+    "        for epoch in range(25):\n",
+    "            model.train()\n",
+    "            epoch_loss = 0\n",
+    "            correct = 0\n",
+    "            total = 0\n",
+    "            \n",
+    "            for bags, labels in tqdm(train_loader, desc=f\"Epoch {epoch+1}\"):\n",
+    "                bags, labels = bags.to(self.device), labels.to(self.device)\n",
+    "                optimizer.zero_grad()\n",
+    "                \n",
+    "                outputs = model(bags)  # Only get logits for training\n",
+    "                loss = criterion(outputs, labels)\n",
+    "                loss.backward()\n",
+    "                optimizer.step()\n",
+    "                \n",
+    "                epoch_loss += loss.item()\n",
+    "                _, predicted = outputs.max(1)\n",
+    "                total += labels.size(0)\n",
+    "                correct += predicted.eq(labels).sum().item()\n",
+    "            \n",
+    "            train_acc = 100 * correct / total\n",
+    "            train_loss = epoch_loss / len(train_loader)\n",
+    "            \n",
+    "            # Validation\n",
+    "            val_loss, val_acc, val_f1, all_labels, all_preds, all_features = self.validate_model(model, val_loader, criterion)\n",
+    "            \n",
+    "            self.metric_history[model_name]['train_loss'].append(train_loss)\n",
+    "            self.metric_history[model_name]['train_acc'].append(train_acc)\n",
+    "            self.metric_history[model_name]['val_loss'].append(val_loss)\n",
+    "            self.metric_history[model_name]['val_acc'].append(val_acc)\n",
+    "            self.metric_history[model_name]['val_f1'].append(val_f1)\n",
+    "            \n",
+    "            scheduler.step(val_acc)\n",
+    "            \n",
+    "            print(f\"{model_name} - Epoch {epoch+1}: \"\n",
+    "                  f\"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | \"\n",
+    "                  f\"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val F1: {val_f1:.4f}\")\n",
+    "            \n",
+    "            if val_acc > best_acc:\n",
+    "                best_acc = val_acc\n",
+    "                no_improve = 0\n",
+    "                torch.save(model.state_dict(), f\"best_{model_name}.pth\")\n",
+    "                self.save_tsne_features(model_name, all_features, all_labels)\n",
+    "            else:\n",
+    "                no_improve += 1\n",
+    "                if no_improve >= self.patience:\n",
+    "                    print(f\"Early stopping at epoch {epoch+1}\")\n",
+    "                    break\n",
+    "        \n",
+    "        model.load_state_dict(torch.load(f\"best_{model_name}.pth\"))\n",
+    "        \n",
+    "        return {\n",
+    "            \"train_loss\": train_loss,\n",
+    "            \"train_acc\": train_acc,\n",
+    "            \"val_loss\": val_loss,\n",
+    "            \"val_acc\": val_acc,\n",
+    "            \"val_f1\": val_f1,\n",
+    "            \"true_labels\": all_labels,\n",
+    "            \"pred_labels\": all_preds\n",
+    "        }\n",
+    "\n",
+    "    def validate_model(self, model, val_loader, criterion):\n",
+    "        model.eval()\n",
+    "        val_loss = 0\n",
+    "        correct = 0\n",
+    "        total = 0\n",
+    "        all_preds = []\n",
+    "        all_labels = []\n",
+    "        all_features = []\n",
+    "        \n",
+    "        with torch.no_grad():\n",
+    "            for bags, labels in val_loader:\n",
+    "                bags, labels = bags.to(self.device), labels.to(self.device)\n",
+    "                outputs, features = model(bags, return_features=True)\n",
+    "                loss = criterion(outputs, labels)\n",
+    "                \n",
+    "                val_loss += loss.item()\n",
+    "                _, predicted = outputs.max(1)\n",
+    "                total += labels.size(0)\n",
+    "                correct += predicted.eq(labels).sum().item()\n",
+    "                all_preds.extend(predicted.cpu().numpy())\n",
+    "                all_labels.extend(labels.cpu().numpy())\n",
+    "                all_features.extend(features.cpu().numpy())\n",
+    "        \n",
+    "        val_acc = 100 * correct / total\n",
+    "        val_loss = val_loss / len(val_loader)\n",
+    "        val_f1 = f1_score(all_labels, all_preds, average='weighted')\n",
+    "        \n",
+    "        return val_loss, val_acc, val_f1, all_labels, all_preds, all_features\n",
+    "\n",
+    "    def save_tsne_features(self, model_name, features, labels):\n",
+    "        os.makedirs(os.path.join(self.base_dir, 'tsne_features'), exist_ok=True)\n",
+    "        np.savez(os.path.join(self.base_dir, 'tsne_features', f'{model_name}_features.npz'),\n",
+    "                features=np.array(features),\n",
+    "                labels=np.array(labels))\n",
+    "\n",
+    "    def save_results(self, results):\n",
+    "        # Create main results directory if it doesn't exist\n",
+    "        results_dir = os.path.join(self.base_dir, 'experiment_results')\n",
+    "        os.makedirs(results_dir, exist_ok=True)\n",
+    "        \n",
+    "        # Save results for each bag size separately\n",
+    "        for bag_size in self.bag_sizes:\n",
+    "            # Create subdirectory for this bag size\n",
+    "            bag_dir = os.path.join(results_dir, f'bag_size_{bag_size}')\n",
+    "            os.makedirs(bag_dir, exist_ok=True)\n",
+    "            \n",
+    "            # Filter results for this bag size\n",
+    "            bag_results = {k:v for k,v in results.items() if f'_bag{bag_size}' in k}\n",
+    "            bag_metrics = {k:v for k,v in self.metric_history.items() if f'_bag{bag_size}' in k}\n",
+    "            \n",
+    "            # Save results\n",
+    "            with open(os.path.join(bag_dir, 'results.pkl'), 'wb') as f:\n",
+    "                pickle.dump(bag_results, f)\n",
+    "            \n",
+    "            with open(os.path.join(bag_dir, 'metric_history.pkl'), 'wb') as f:\n",
+    "                pickle.dump(bag_metrics, f)\n",
+    "            \n",
+    "            # Create plots subdirectory\n",
+    "            plots_dir = os.path.join(bag_dir, 'plots')\n",
+    "            os.makedirs(plots_dir, exist_ok=True)\n",
+    "            \n",
+    "            # Save plots for this bag size\n",
+    "            self.plot_training_curves(bag_metrics, plots_dir, bag_size)\n",
+    "            self.plot_tsne(plots_dir, bag_size)\n",
+    "        \n",
+    "        print(\"Results and visualizations saved successfully for all bag sizes\")\n",
+    "\n",
+    "    def plot_training_curves(self, metrics, save_dir, bag_size):\n",
+    "        plt.figure(figsize=(15, 10))\n",
+    "        \n",
+    "        for model_name, metric_data in metrics.items():\n",
+    "            epochs = range(1, len(metric_data['train_loss']) + 1)\n",
+    "            \n",
+    "            plt.subplot(2, 2, 1)\n",
+    "            plt.plot(epochs, metric_data['train_loss'], label=f'{model_name} Train')\n",
+    "            plt.plot(epochs, metric_data['val_loss'], label=f'{model_name} Val')\n",
+    "            plt.title(f'Loss Curve (Bag Size {bag_size})')\n",
+    "            plt.xlabel('Epochs')\n",
+    "            plt.ylabel('Loss')\n",
+    "            plt.legend()\n",
+    "            \n",
+    "            plt.subplot(2, 2, 2)\n",
+    "            plt.plot(epochs, metric_data['train_acc'], label=f'{model_name} Train')\n",
+    "            plt.plot(epochs, metric_data['val_acc'], label=f'{model_name} Val')\n",
+    "            plt.title(f'Accuracy Curve (Bag Size {bag_size})')\n",
+    "            plt.xlabel('Epochs')\n",
+    "            plt.ylabel('Accuracy (%)')\n",
+    "            plt.legend()\n",
+    "            \n",
+    "            plt.subplot(2, 2, 3)\n",
+    "            plt.plot(epochs, metric_data['val_f1'], label=f'{model_name}')\n",
+    "            plt.title(f'Validation F1 Score (Bag Size {bag_size})')\n",
+    "            plt.xlabel('Epochs')\n",
+    "            plt.ylabel('F1 Score')\n",
+    "            plt.legend()\n",
+    "        \n",
+    "        plt.tight_layout()\n",
+    "        plt.savefig(os.path.join(save_dir, f'training_curves_bag{bag_size}.png'))\n",
+    "        plt.close()\n",
+    "\n",
+    "    def plot_tsne(self, save_dir, bag_size):\n",
+    "        tsne = TSNE(n_components=2, random_state=42)\n",
+    "        feature_files = [f for f in os.listdir(os.path.join(self.base_dir, 'tsne_features')) \n",
+    "                    if f.endswith('.npz') and f'_bag{bag_size}_' in f]\n",
+    "        \n",
+    "        if not feature_files:\n",
+    "            print(f\"No t-SNE features found for bag size {bag_size}\")\n",
+    "            return\n",
+    "        \n",
+    "        plt.figure(figsize=(15, 10))\n",
+    "        \n",
+    "        for i, feature_file in enumerate(feature_files, 1):\n",
+    "            data = np.load(os.path.join(self.base_dir, 'tsne_features', feature_file))\n",
+    "            features = data['features']\n",
+    "            labels = data['labels']\n",
+    "            \n",
+    "            # Calculate safe perplexity\n",
+    "            n_samples = len(features)\n",
+    "            safe_perplexity = min(30, max(5, n_samples // 3))\n",
+    "            \n",
+    "            try:\n",
+    "                tsne_results = tsne.fit_transform(features)\n",
+    "                \n",
+    "                df = pd.DataFrame()\n",
+    "                df['tsne-2d-one'] = tsne_results[:,0]\n",
+    "                df['tsne-2d-two'] = tsne_results[:,1]\n",
+    "                df['label'] = labels\n",
+    "                df['class'] = df['label'].apply(lambda x: self.class_labels[x])\n",
+    "                \n",
+    "                plt.subplot(2, 2, i)\n",
+    "                sns.scatterplot(\n",
+    "                    x=\"tsne-2d-one\", y=\"tsne-2d-two\",\n",
+    "                    hue=\"class\",\n",
+    "                    palette=sns.color_palette(\"hls\", len(self.class_labels)),\n",
+    "                    data=df,\n",
+    "                    legend=\"full\",\n",
+    "                    alpha=0.7\n",
+    "                )\n",
+    "                plt.title(f't-SNE: {feature_file.replace(\"_features.npz\", \"\")} (perplexity={safe_perplexity})')\n",
+    "            except Exception as e:\n",
+    "                print(f\"Could not generate t-SNE for {feature_file}: {str(e)}\")\n",
+    "                continue\n",
+    "        \n",
+    "        plt.tight_layout()\n",
+    "        plt.savefig(os.path.join(save_dir, f'tsne_visualization_bag{bag_size}.png'))\n",
+    "        plt.close()\n",
+    "\n",
+    "    def analyze_results(self, results):\n",
+    "        print(\"\\n=== Detailed Performance Analysis ===\")\n",
+    "        for key, trials in results.items():\n",
+    "            print(f\"\\n{key} Performance:\")\n",
+    "            for i, trial in enumerate(trials, 1):\n",
+    "                print(f\"\\nTrial {i}:\")\n",
+    "                print(f\"Val Accuracy: {trial['val_acc']:.2f}%\")\n",
+    "                print(f\"Val F1 Score: {trial['val_f1']:.4f}\")\n",
+    "                print(\"Confusion Matrix:\")\n",
+    "                print(confusion_matrix(trial['true_labels'], trial['pred_labels']))\n",
+    "                print(\"Classification Report:\")\n",
+    "                print(classification_report(trial['true_labels'], trial['pred_labels'], \n",
+    "                                      target_names=self.class_labels))\n",
+    "            \n",
+    "            avg_acc = np.mean([t['val_acc'] for t in trials])\n",
+    "            avg_f1 = np.mean([t['val_f1'] for t in trials])\n",
+    "            print(f\"\\nAverage Val Accuracy: {avg_acc:.2f}%\")\n",
+    "            print(f\"Average Val F1 Score: {avg_f1:.4f}\")\n",
+    "\n",
+    "    def run_experiments(self):\n",
+    "        if not os.path.exists(os.path.join(self.base_dir, 'preprocessed_dataFull.npz')):\n",
+    "            print(\"Preprocessing data...\")\n",
+    "            self.preprocess_and_save_data()\n",
+    "        \n",
+    "        bags, labels = self.load_preprocessed_data()\n",
+    "        print(f\"Loaded {len(bags)} bags with distribution: {np.unique(labels, return_counts=True)}\")\n",
+    "        \n",
+    "        results = {}\n",
+    "        \n",
+    "        for bag_size in self.bag_sizes:\n",
+    "            print(f\"\\n{'='*60}\\nEvaluating Bag Size: {bag_size}\\n{'='*60}\")\n",
+    "            \n",
+    "            for method_name, model_class in self.mil_methods.items():\n",
+    "                trial_results = []\n",
+    "                \n",
+    "                for trial in range(1, self.num_trials + 1):\n",
+    "                    torch.manual_seed(42 + trial)\n",
+    "                    np.random.seed(42 + trial)\n",
+    "                    \n",
+    "                    print(f\"\\nTrial {trial} for {method_name} with bag size {bag_size}\")\n",
+    "                    \n",
+    "                    train_data, val_data, _ = self.prepare_datasets(bags, labels, bag_size)\n",
+    "                    \n",
+    "                    model = model_class(num_classes=len(self.class_labels)).to(self.device)\n",
+    "                    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)\n",
+    "                    \n",
+    "                    metrics = self.train_evaluate(\n",
+    "                        model, optimizer, train_data, val_data, \n",
+    "                        f\"{method_name}_bag{bag_size}_trial{trial}\")\n",
+    "                    \n",
+    "                    trial_results.append(metrics)\n",
+    "                \n",
+    "                results[f\"{method_name}_bag{bag_size}\"] = trial_results\n",
+    "                \n",
+    "        self.save_results(results)\n",
+    "        self.analyze_results(results)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Run"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "cuda\n",
+      "Loaded 513 bags with distribution: (array([0, 1, 2, 3, 4]), array([ 94,  41,  42, 217, 119]))\n",
+      "\n",
+      "============================================================\n",
+      "Evaluating Bag Size: 50\n",
+      "============================================================\n",
+      "\n",
+      "Trial 1 for InstanceMIL with bag size 50\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/miniconda3/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\"The verbose parameter is deprecated. Please use get_last_lr() \"\n",
+      "Epoch 1:   0%|          | 0/77 [00:00<?, ?it/s]/root/miniconda3/lib/python3.11/site-packages/torch/nn/modules/conv.py:456: UserWarning: Applied workaround for CuDNN issue, install nvrtc.so (Triggered internally at /opt/conda/conda-bld/pytorch_1704987615470/work/aten/src/ATen/native/cudnn/Conv_v8.cpp:80.)\n",
+      "  return F.conv2d(input, weight, bias, self.stride,\n",
+      "Epoch 1: 100%|██████████| 77/77 [00:56<00:00,  1.36it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 1: Train Loss: 1.6338, Train Acc: 33.55% | Val Loss: 1.5118, Val Acc: 33.01%, Val F1: 0.2664\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2: 100%|██████████| 77/77 [00:57<00:00,  1.34it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 2: Train Loss: 1.0453, Train Acc: 61.56% | Val Loss: 1.0845, Val Acc: 60.19%, Val F1: 0.6077\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3: 100%|██████████| 77/77 [00:57<00:00,  1.33it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 3: Train Loss: 0.6782, Train Acc: 77.52% | Val Loss: 1.0034, Val Acc: 58.25%, Val F1: 0.5870\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 4: Train Loss: 0.3624, Train Acc: 89.25% | Val Loss: 0.9799, Val Acc: 66.99%, Val F1: 0.6679\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 5: Train Loss: 0.2144, Train Acc: 96.42% | Val Loss: 1.0607, Val Acc: 63.11%, Val F1: 0.6048\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 6: Train Loss: 0.1248, Train Acc: 97.72% | Val Loss: 0.8452, Val Acc: 72.82%, Val F1: 0.7312\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 7: Train Loss: 0.0807, Train Acc: 98.37% | Val Loss: 0.7592, Val Acc: 71.84%, Val F1: 0.7267\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 8: Train Loss: 0.0869, Train Acc: 98.37% | Val Loss: 0.9498, Val Acc: 71.84%, Val F1: 0.7178\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 9: Train Loss: 0.0662, Train Acc: 99.02% | Val Loss: 1.0589, Val Acc: 66.99%, Val F1: 0.6543\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 10: Train Loss: 0.0767, Train Acc: 98.05% | Val Loss: 0.9609, Val Acc: 71.84%, Val F1: 0.7181\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 11: Train Loss: 0.0411, Train Acc: 99.67% | Val Loss: 0.9409, Val Acc: 69.90%, Val F1: 0.6861\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 12: Train Loss: 0.0259, Train Acc: 100.00% | Val Loss: 0.9892, Val Acc: 70.87%, Val F1: 0.6915\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 13: Train Loss: 0.0225, Train Acc: 99.67% | Val Loss: 0.8378, Val Acc: 72.82%, Val F1: 0.7204\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 14: Train Loss: 0.0318, Train Acc: 99.35% | Val Loss: 0.9509, Val Acc: 69.90%, Val F1: 0.6834\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 15: Train Loss: 0.0150, Train Acc: 100.00% | Val Loss: 0.8942, Val Acc: 71.84%, Val F1: 0.7081\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial1 - Epoch 16: Train Loss: 0.0140, Train Acc: 99.67% | Val Loss: 0.9337, Val Acc: 72.82%, Val F1: 0.7154\n",
+      "Early stopping at epoch 16\n",
+      "\n",
+      "Trial 2 for InstanceMIL with bag size 50\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/miniconda3/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\"The verbose parameter is deprecated. Please use get_last_lr() \"\n",
+      "Epoch 1: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 1: Train Loss: 1.7412, Train Acc: 27.69% | Val Loss: 1.3321, Val Acc: 59.22%, Val F1: 0.5821\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 2: Train Loss: 1.0131, Train Acc: 62.21% | Val Loss: 1.1557, Val Acc: 63.11%, Val F1: 0.5668\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 3: Train Loss: 0.5758, Train Acc: 81.43% | Val Loss: 1.1139, Val Acc: 63.11%, Val F1: 0.6122\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 4: Train Loss: 0.3328, Train Acc: 89.58% | Val Loss: 0.9113, Val Acc: 62.14%, Val F1: 0.5993\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 5: Train Loss: 0.2421, Train Acc: 92.83% | Val Loss: 0.9933, Val Acc: 69.90%, Val F1: 0.6783\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 6: Train Loss: 0.1379, Train Acc: 96.74% | Val Loss: 0.8556, Val Acc: 70.87%, Val F1: 0.7115\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 7: Train Loss: 0.0995, Train Acc: 98.05% | Val Loss: 0.9051, Val Acc: 74.76%, Val F1: 0.7477\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 8: Train Loss: 0.1078, Train Acc: 98.05% | Val Loss: 0.7984, Val Acc: 76.70%, Val F1: 0.7760\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 9: Train Loss: 0.0656, Train Acc: 98.70% | Val Loss: 0.8898, Val Acc: 72.82%, Val F1: 0.7244\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 10: Train Loss: 0.0560, Train Acc: 98.70% | Val Loss: 1.0358, Val Acc: 68.93%, Val F1: 0.7033\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 11: Train Loss: 0.0566, Train Acc: 98.05% | Val Loss: 0.8793, Val Acc: 69.90%, Val F1: 0.7067\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 12: Train Loss: 0.0294, Train Acc: 100.00% | Val Loss: 1.0753, Val Acc: 69.90%, Val F1: 0.6944\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 13: Train Loss: 0.0221, Train Acc: 99.35% | Val Loss: 1.0743, Val Acc: 70.87%, Val F1: 0.7041\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 14: Train Loss: 0.0147, Train Acc: 100.00% | Val Loss: 1.0914, Val Acc: 71.84%, Val F1: 0.7103\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 15: Train Loss: 0.0158, Train Acc: 99.67% | Val Loss: 1.0739, Val Acc: 66.99%, Val F1: 0.6678\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 16: Train Loss: 0.0171, Train Acc: 100.00% | Val Loss: 0.9356, Val Acc: 74.76%, Val F1: 0.7420\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 17: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 17: Train Loss: 0.0117, Train Acc: 100.00% | Val Loss: 0.9545, Val Acc: 76.70%, Val F1: 0.7581\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 18: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "InstanceMIL_bag50_trial2 - Epoch 18: Train Loss: 0.0115, Train Acc: 100.00% | Val Loss: 0.9064, Val Acc: 73.79%, Val F1: 0.7313\n",
+      "Early stopping at epoch 18\n",
+      "\n",
+      "Trial 1 for EmbeddingMIL with bag size 50\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/miniconda3/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\"The verbose parameter is deprecated. Please use get_last_lr() \"\n",
+      "Epoch 1: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 1: Train Loss: 1.4816, Train Acc: 41.04% | Val Loss: 1.2272, Val Acc: 49.51%, Val F1: 0.4622\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 2: Train Loss: 1.2053, Train Acc: 57.33% | Val Loss: 0.8580, Val Acc: 62.14%, Val F1: 0.6390\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 3: Train Loss: 0.9460, Train Acc: 64.82% | Val Loss: 0.7394, Val Acc: 72.82%, Val F1: 0.7354\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 4: Train Loss: 0.7884, Train Acc: 73.29% | Val Loss: 0.8842, Val Acc: 66.99%, Val F1: 0.6637\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 5: Train Loss: 0.5838, Train Acc: 79.15% | Val Loss: 0.6787, Val Acc: 72.82%, Val F1: 0.7164\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 6: Train Loss: 0.4322, Train Acc: 86.32% | Val Loss: 0.7416, Val Acc: 79.61%, Val F1: 0.8019\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 7: Train Loss: 0.3267, Train Acc: 89.58% | Val Loss: 0.5894, Val Acc: 81.55%, Val F1: 0.8182\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 8: Train Loss: 0.2810, Train Acc: 91.86% | Val Loss: 0.9638, Val Acc: 68.93%, Val F1: 0.6735\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 9: Train Loss: 0.2453, Train Acc: 92.18% | Val Loss: 0.6243, Val Acc: 76.70%, Val F1: 0.7461\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 10: Train Loss: 0.1577, Train Acc: 95.44% | Val Loss: 0.6046, Val Acc: 75.73%, Val F1: 0.7449\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 11: Train Loss: 0.1439, Train Acc: 95.11% | Val Loss: 0.9471, Val Acc: 69.90%, Val F1: 0.6918\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 12: Train Loss: 0.1757, Train Acc: 96.09% | Val Loss: 0.6086, Val Acc: 76.70%, Val F1: 0.7737\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 13: Train Loss: 0.0720, Train Acc: 99.35% | Val Loss: 0.6018, Val Acc: 79.61%, Val F1: 0.8005\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 14: Train Loss: 0.0753, Train Acc: 98.37% | Val Loss: 0.6006, Val Acc: 78.64%, Val F1: 0.7936\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 15: Train Loss: 0.0355, Train Acc: 99.67% | Val Loss: 0.6183, Val Acc: 75.73%, Val F1: 0.7408\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 16: Train Loss: 0.0283, Train Acc: 99.35% | Val Loss: 0.5378, Val Acc: 81.55%, Val F1: 0.8158\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 17: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial1 - Epoch 17: Train Loss: 0.0274, Train Acc: 99.35% | Val Loss: 0.5792, Val Acc: 80.58%, Val F1: 0.8168\n",
+      "Early stopping at epoch 17\n",
+      "\n",
+      "Trial 2 for EmbeddingMIL with bag size 50\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/miniconda3/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\"The verbose parameter is deprecated. Please use get_last_lr() \"\n",
+      "Epoch 1: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 1: Train Loss: 1.5217, Train Acc: 39.74% | Val Loss: 1.1792, Val Acc: 65.05%, Val F1: 0.6252\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 2: Train Loss: 1.1799, Train Acc: 57.65% | Val Loss: 0.9944, Val Acc: 63.11%, Val F1: 0.5814\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 3: Train Loss: 0.9593, Train Acc: 69.06% | Val Loss: 0.9041, Val Acc: 68.93%, Val F1: 0.6818\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 4: Train Loss: 0.7382, Train Acc: 77.20% | Val Loss: 0.9201, Val Acc: 63.11%, Val F1: 0.6262\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 5: Train Loss: 0.5759, Train Acc: 78.50% | Val Loss: 1.0900, Val Acc: 64.08%, Val F1: 0.6223\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 6: Train Loss: 0.4549, Train Acc: 83.39% | Val Loss: 3.7460, Val Acc: 33.98%, Val F1: 0.3556\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 7: Train Loss: 0.3511, Train Acc: 87.95% | Val Loss: 0.6994, Val Acc: 73.79%, Val F1: 0.7418\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 8: Train Loss: 0.2567, Train Acc: 92.51% | Val Loss: 1.1296, Val Acc: 68.93%, Val F1: 0.7109\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 9: Train Loss: 0.2704, Train Acc: 93.49% | Val Loss: 1.1795, Val Acc: 68.93%, Val F1: 0.6663\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 10: Train Loss: 0.2221, Train Acc: 92.18% | Val Loss: 1.0095, Val Acc: 72.82%, Val F1: 0.7351\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 11: Train Loss: 0.1531, Train Acc: 95.11% | Val Loss: 0.8184, Val Acc: 79.61%, Val F1: 0.8038\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 12: Train Loss: 0.1549, Train Acc: 96.09% | Val Loss: 1.0226, Val Acc: 66.99%, Val F1: 0.6561\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 13: Train Loss: 0.1718, Train Acc: 93.81% | Val Loss: 0.6399, Val Acc: 74.76%, Val F1: 0.7441\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 14: Train Loss: 0.1042, Train Acc: 98.37% | Val Loss: 0.7176, Val Acc: 77.67%, Val F1: 0.7797\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 15: Train Loss: 0.0765, Train Acc: 98.37% | Val Loss: 1.0168, Val Acc: 68.93%, Val F1: 0.6783\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 16: Train Loss: 0.0450, Train Acc: 99.67% | Val Loss: 0.6283, Val Acc: 82.52%, Val F1: 0.8283\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 17: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 17: Train Loss: 0.0256, Train Acc: 99.67% | Val Loss: 0.5619, Val Acc: 83.50%, Val F1: 0.8390\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 18: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 18: Train Loss: 0.0220, Train Acc: 100.00% | Val Loss: 0.6085, Val Acc: 81.55%, Val F1: 0.8199\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 19: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 19: Train Loss: 0.0166, Train Acc: 99.67% | Val Loss: 0.5891, Val Acc: 80.58%, Val F1: 0.8078\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 20: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 20: Train Loss: 0.0328, Train Acc: 99.67% | Val Loss: 0.7071, Val Acc: 81.55%, Val F1: 0.8176\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 21: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 21: Train Loss: 0.0185, Train Acc: 100.00% | Val Loss: 0.5944, Val Acc: 81.55%, Val F1: 0.8182\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 22: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 22: Train Loss: 0.0201, Train Acc: 99.35% | Val Loss: 0.6143, Val Acc: 82.52%, Val F1: 0.8262\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 23: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 23: Train Loss: 0.0136, Train Acc: 100.00% | Val Loss: 0.5978, Val Acc: 83.50%, Val F1: 0.8373\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 24: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 24: Train Loss: 0.0111, Train Acc: 100.00% | Val Loss: 0.6137, Val Acc: 82.52%, Val F1: 0.8293\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 25: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "EmbeddingMIL_bag50_trial2 - Epoch 25: Train Loss: 0.0081, Train Acc: 100.00% | Val Loss: 0.5681, Val Acc: 84.47%, Val F1: 0.8481\n",
+      "\n",
+      "Trial 1 for ImprovedAttentionMIL with bag size 50\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/miniconda3/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\"The verbose parameter is deprecated. Please use get_last_lr() \"\n",
+      "Epoch 1: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 1: Train Loss: 1.4923, Train Acc: 42.35% | Val Loss: 1.3459, Val Acc: 54.37%, Val F1: 0.5178\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 2: Train Loss: 1.2140, Train Acc: 54.72% | Val Loss: 0.9201, Val Acc: 64.08%, Val F1: 0.6460\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 3: Train Loss: 0.9396, Train Acc: 64.82% | Val Loss: 1.0116, Val Acc: 53.40%, Val F1: 0.5258\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 4: Train Loss: 0.7042, Train Acc: 72.31% | Val Loss: 1.2377, Val Acc: 58.25%, Val F1: 0.5693\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 5: Train Loss: 0.7028, Train Acc: 78.83% | Val Loss: 0.9616, Val Acc: 60.19%, Val F1: 0.6197\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 6: Train Loss: 0.3995, Train Acc: 87.95% | Val Loss: 1.1448, Val Acc: 66.02%, Val F1: 0.6303\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 7: Train Loss: 0.2584, Train Acc: 92.18% | Val Loss: 1.0963, Val Acc: 71.84%, Val F1: 0.7247\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 8: Train Loss: 0.1046, Train Acc: 96.74% | Val Loss: 0.7619, Val Acc: 72.82%, Val F1: 0.7187\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 9: Train Loss: 0.0935, Train Acc: 98.05% | Val Loss: 1.1327, Val Acc: 63.11%, Val F1: 0.6133\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 10: Train Loss: 0.2829, Train Acc: 89.58% | Val Loss: 1.0390, Val Acc: 61.17%, Val F1: 0.6064\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 11: Train Loss: 0.1150, Train Acc: 95.11% | Val Loss: 1.2816, Val Acc: 63.11%, Val F1: 0.6372\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 12: Train Loss: 0.1978, Train Acc: 92.83% | Val Loss: 1.6348, Val Acc: 66.99%, Val F1: 0.6724\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 13: Train Loss: 0.0894, Train Acc: 96.74% | Val Loss: 1.1113, Val Acc: 73.79%, Val F1: 0.7435\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 14: Train Loss: 0.0446, Train Acc: 98.37% | Val Loss: 1.3063, Val Acc: 70.87%, Val F1: 0.7066\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 15: Train Loss: 0.0151, Train Acc: 99.67% | Val Loss: 1.1321, Val Acc: 71.84%, Val F1: 0.7104\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 16: Train Loss: 0.0187, Train Acc: 99.67% | Val Loss: 1.3592, Val Acc: 72.82%, Val F1: 0.7178\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 17: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 17: Train Loss: 0.0166, Train Acc: 99.67% | Val Loss: 1.3707, Val Acc: 75.73%, Val F1: 0.7542\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 18: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 18: Train Loss: 0.0057, Train Acc: 100.00% | Val Loss: 1.3766, Val Acc: 74.76%, Val F1: 0.7466\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 19: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 19: Train Loss: 0.0229, Train Acc: 99.02% | Val Loss: 1.4549, Val Acc: 70.87%, Val F1: 0.6963\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 20: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 20: Train Loss: 0.0037, Train Acc: 100.00% | Val Loss: 1.2669, Val Acc: 76.70%, Val F1: 0.7632\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 21: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 21: Train Loss: 0.0015, Train Acc: 100.00% | Val Loss: 1.2662, Val Acc: 78.64%, Val F1: 0.7829\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 22: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 22: Train Loss: 0.0044, Train Acc: 100.00% | Val Loss: 1.3857, Val Acc: 70.87%, Val F1: 0.7089\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 23: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 23: Train Loss: 0.0023, Train Acc: 100.00% | Val Loss: 1.3382, Val Acc: 77.67%, Val F1: 0.7736\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 24: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 24: Train Loss: 0.0023, Train Acc: 100.00% | Val Loss: 1.2841, Val Acc: 73.79%, Val F1: 0.7362\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 25: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial1 - Epoch 25: Train Loss: 0.0004, Train Acc: 100.00% | Val Loss: 1.3443, Val Acc: 76.70%, Val F1: 0.7647\n",
+      "\n",
+      "Trial 2 for ImprovedAttentionMIL with bag size 50\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/root/miniconda3/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:28: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\"The verbose parameter is deprecated. Please use get_last_lr() \"\n",
+      "Epoch 1: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 1: Train Loss: 1.4964, Train Acc: 42.35% | Val Loss: 1.3057, Val Acc: 51.46%, Val F1: 0.4942\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 2: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 2: Train Loss: 1.1298, Train Acc: 55.05% | Val Loss: 0.8780, Val Acc: 62.14%, Val F1: 0.6287\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 3: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 3: Train Loss: 0.8190, Train Acc: 69.06% | Val Loss: 0.8231, Val Acc: 70.87%, Val F1: 0.7126\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 4: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 4: Train Loss: 0.8260, Train Acc: 73.62% | Val Loss: 0.7346, Val Acc: 74.76%, Val F1: 0.7442\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 5: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 5: Train Loss: 0.5692, Train Acc: 79.15% | Val Loss: 0.9282, Val Acc: 52.43%, Val F1: 0.5087\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 6: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 6: Train Loss: 0.4601, Train Acc: 83.39% | Val Loss: 0.7043, Val Acc: 68.93%, Val F1: 0.6895\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 7: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 7: Train Loss: 0.2825, Train Acc: 90.23% | Val Loss: 1.0404, Val Acc: 72.82%, Val F1: 0.7344\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 8: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 8: Train Loss: 0.1490, Train Acc: 92.83% | Val Loss: 0.9209, Val Acc: 66.02%, Val F1: 0.6578\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 9: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 9: Train Loss: 0.1462, Train Acc: 95.11% | Val Loss: 0.6585, Val Acc: 75.73%, Val F1: 0.7457\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 10: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 10: Train Loss: 0.0564, Train Acc: 98.70% | Val Loss: 0.8396, Val Acc: 71.84%, Val F1: 0.7263\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 11: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 11: Train Loss: 0.0557, Train Acc: 97.72% | Val Loss: 0.8424, Val Acc: 75.73%, Val F1: 0.7506\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 12: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 12: Train Loss: 0.0375, Train Acc: 98.37% | Val Loss: 0.8987, Val Acc: 75.73%, Val F1: 0.7567\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 13: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 13: Train Loss: 0.0364, Train Acc: 98.37% | Val Loss: 0.7573, Val Acc: 75.73%, Val F1: 0.7540\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 14: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 14: Train Loss: 0.0152, Train Acc: 99.35% | Val Loss: 0.7782, Val Acc: 73.79%, Val F1: 0.7334\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 15: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 15: Train Loss: 0.0062, Train Acc: 100.00% | Val Loss: 0.7841, Val Acc: 77.67%, Val F1: 0.7710\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 16: 100%|██████████| 77/77 [00:58<00:00,  1.32it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 16: Train Loss: 0.0063, Train Acc: 100.00% | Val Loss: 0.7695, Val Acc: 74.76%, Val F1: 0.7460\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 17: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 17: Train Loss: 0.0051, Train Acc: 100.00% | Val Loss: 0.8153, Val Acc: 72.82%, Val F1: 0.7225\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 18: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 18: Train Loss: 0.0028, Train Acc: 100.00% | Val Loss: 0.7813, Val Acc: 72.82%, Val F1: 0.7225\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 19: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 19: Train Loss: 0.0038, Train Acc: 99.67% | Val Loss: 0.7913, Val Acc: 73.79%, Val F1: 0.7361\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 20: 100%|██████████| 77/77 [00:58<00:00,  1.31it/s]\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "ImprovedAttentionMIL_bag50_trial2 - Epoch 20: Train Loss: 0.0060, Train Acc: 100.00% | Val Loss: 0.8343, Val Acc: 73.79%, Val F1: 0.7324\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Epoch 21:   3%|▎         | 2/77 [00:01<00:57,  1.32it/s]"
+     ]
+    }
+   ],
+   "source": [
+    "if __name__ == \"__main__\":\n",
+    "    experiment = MILExperiment(\n",
+    "        base_dir=\"/root/occFinal-ACM MM/finalResults\",\n",
+    "        main_data_dir=\"/root/occFinal-ACM MM/50 tiles/\",\n",
+    "        # file_str = \"preprocessed_data.npz\"\n",
+    "        max_bags_per_class=50\n",
+    "    )\n",
+    "    experiment.run_experiments()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# experiment = MILExperiment(\n",
+    "#     base_dir=\"/root/occFinal-ACM MM/finalResults/\",\n",
+    "#     main_data_dir=\"/root/occFinal-ACM MM/50 tiles/\",\n",
+    "#     max_bags_per_class=10  # Now this will be respected\n",
+    "# )\n",
+    "\n",
+    "# # Analyze full dataset\n",
+    "# experiment.analyze_preprocessed_data()\n",
+    "\n",
+    "# # Load subset of data\n",
+    "# bags, labels = experiment.load_preprocessed_data(max_bags_per_class=10)\n",
+    "# print(f\"\\nWorking with {len(bags)} bags\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "base",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
